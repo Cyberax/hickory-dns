@@ -8,7 +8,7 @@
 // TODO, I've implemented this as a separate entity from the cache, but I wonder if the cache
 //  should be the only "front-end" for lookups, where if that misses, then we go to the catalog
 //  then, if requested, do a recursive lookup... i.e. the catalog would only point to files.
-use std::{collections::HashMap, iter, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, iter, sync::Arc};
 
 use ipnet::IpNet;
 use tracing::{debug, error, info, trace, warn};
@@ -20,7 +20,6 @@ use crate::{
     dnssec::NxProofKind,
     proto::{
         dnssec::{DnssecSummary, rdata::DNSSECRData},
-        rr::RData,
         serialize::binary::BinEncoder,
     },
     zone_handler::Nsec3QueryInfo,
@@ -31,7 +30,7 @@ use crate::{
     proto::{
         op::{Edns, Header, LowerQuery, Message, MessageType, OpCode, ResponseCode},
         rr::{
-            LowerName, RecordSet, RecordType,
+            LowerName, RData, Record, RecordSet, RecordType,
             rdata::opt::{EdnsCode, EdnsOption, NSIDPayload},
         },
     },
@@ -516,6 +515,7 @@ impl Catalog {
                 request,
                 response_edns,
                 response_handle.clone(),
+                self,
                 #[cfg(feature = "metrics")]
                 &self.metrics,
             )
@@ -539,6 +539,101 @@ impl Catalog {
             }
         })
     }
+
+    /// Chase a CNAME chain across zones, returning the collected records.
+    ///
+    /// When an authoritative zone returns a CNAME pointing outside the zone, and the client
+    /// set RD=1, we need to resolve the CNAME target. This method looks up the target through
+    /// the catalog, which naturally uses local zone data when available (works offline) and
+    /// falls through to the recursive handler for external names.
+    ///
+    /// Returns the additional answer records to append, and whether any lookup used a
+    /// non-authoritative (External) zone handler.
+    async fn resolve_cname_chain(
+        &self,
+        cname_target: LowerName,
+        query_type: RecordType,
+        lookup_options: LookupOptions,
+    ) -> (Vec<Record>, bool) {
+        const MAX_CNAME_DEPTH: usize = 8;
+        let mut records = Vec::new();
+        let mut current_name = cname_target.clone();
+        let mut used_non_authoritative = false;
+        let mut visited = HashSet::new();
+        visited.insert(cname_target);
+
+        for _ in 0..MAX_CNAME_DEPTH {
+            let Some(entry) = self.find_entry(&current_name) else {
+                break;
+            };
+
+            let mut resolved = false;
+            for handler in &entry.handlers {
+                let is_external = matches!(handler.zone_type(), ZoneType::External);
+
+                let result = handler
+                    .lookup(&current_name, query_type, None, lookup_options)
+                    .await;
+                let Some(result) = result.map_result() else {
+                    continue;
+                };
+                match result {
+                    Ok(auth_lookup) => {
+                        let mut found_target_type = false;
+                        let mut next_cname: Option<LowerName> = None;
+
+                        for record in auth_lookup.iter() {
+                            if record.record_type() == query_type {
+                                found_target_type = true;
+                            }
+                            if record.record_type() == RecordType::CNAME {
+                                if let RData::CNAME(cname) = record.data() {
+                                    next_cname = Some(LowerName::from(cname.0.clone()));
+                                }
+                            }
+                            records.push(record.clone());
+                        }
+
+                        if is_external {
+                            used_non_authoritative = true;
+                        }
+
+                        if found_target_type {
+                            resolved = true;
+                            break;
+                        }
+
+                        if let Some(next) = next_cname {
+                            if !visited.insert(next.clone()) {
+                                // Already visited this name -- CNAME loop detected.
+                                // Discard the records from this iteration since they
+                                // point back into the loop (e.g. wildcard self-match).
+                                let loop_count = auth_lookup.iter().count();
+                                records.truncate(records.len().saturating_sub(loop_count));
+                                resolved = false;
+                                break;
+                            }
+                            current_name = next;
+                            resolved = true;
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            if !resolved {
+                break;
+            }
+
+            // If we found the target record type, we're done
+            if records.iter().any(|r| r.record_type() == query_type) {
+                break;
+            }
+        }
+
+        (records, used_non_authoritative)
+    }
 }
 
 async fn lookup<R: ResponseHandler + Unpin>(
@@ -547,6 +642,7 @@ async fn lookup<R: ResponseHandler + Unpin>(
     request: &Request,
     response_edns: Option<&Edns>,
     mut response_handle: R,
+    catalog: &Catalog,
     #[cfg(feature = "metrics")] metrics: &CatalogMetrics,
 ) -> ResponseInfo {
     let edns = request.edns();
@@ -620,9 +716,36 @@ async fn lookup<R: ResponseHandler + Unpin>(
             .await;
         };
 
+        // When RD=1 and the handler is authoritative, resolve CNAME chains so the full
+        // answer appears in the answers section (within from the additionals, or cross-zone
+        // via the catalog).
+        let cname_resolution =
+            if request.header().recursion_desired()
+                && matches!(handler.zone_type(), ZoneType::Primary | ZoneType::Secondary)
+            {
+                resolve_cnames_for_recursion(result, query, lookup_options, catalog).await
+            } else {
+                CnameResolution {
+                    result,
+                    resolved: false,
+                    used_non_authoritative: false,
+                }
+            };
+
+        let CnameResolution {
+            result,
+            resolved,
+            used_non_authoritative,
+        } = cname_resolution;
+        let cname_flags = CnameFlags {
+            resolved,
+            used_non_authoritative,
+        };
+
         let response_message = build_response(
             result,
             &**handler,
+            &cname_flags,
             request_id,
             request.header(),
             query,
@@ -844,10 +967,127 @@ async fn send_error_response(
     }
 }
 
+/// Flags from CNAME resolution, passed to the response builder.
+struct CnameFlags {
+    /// Whether the CNAME chain was resolved (records were moved/added to answers).
+    resolved: bool,
+    /// Whether a non-authoritative (External) zone handler contributed records.
+    used_non_authoritative: bool,
+}
+
+/// Result of CNAME resolution for an authoritative response with RD=1.
+struct CnameResolution {
+    result: Result<AuthLookup, LookupError>,
+    resolved: bool,
+    used_non_authoritative: bool,
+}
+
+/// When an authoritative zone returns a CNAME and RD=1, ensure the full resolution chain
+/// appears in the answer section. This handles two cases:
+///
+/// 1. Within-zone CNAME: the target was already resolved by `additional_search` and the
+///    records sit in the additionals section. We move them into answers.
+/// 2. Cross-zone CNAME: the target is outside the zone. We chase it through the catalog,
+///    which uses local zone data when available and falls through to recursive handlers.
+async fn resolve_cnames_for_recursion(
+    result: Result<AuthLookup, LookupError>,
+    query: &LowerQuery,
+    lookup_options: LookupOptions,
+    catalog: &Catalog,
+) -> CnameResolution {
+    let query_type = query.query_type();
+    if query_type == RecordType::CNAME || query_type == RecordType::ANY {
+        return CnameResolution {
+            result,
+            resolved: false,
+            used_non_authoritative: false,
+        };
+    }
+
+    let Ok(auth_lookup) = result else {
+        return CnameResolution {
+            result,
+            resolved: false,
+            used_non_authoritative: false,
+        };
+    };
+
+    // Check if answers already contain the target type (no CNAME to chase).
+    let mut cname_target: Option<LowerName> = None;
+    let mut has_target_type = false;
+    for record in auth_lookup.iter() {
+        if record.record_type() == query_type {
+            has_target_type = true;
+            break;
+        }
+        if record.record_type() == RecordType::CNAME {
+            if let RData::CNAME(cname) = record.data() {
+                cname_target = Some(LowerName::from(cname.0.clone()));
+            }
+        }
+    }
+
+    if has_target_type || cname_target.is_none() {
+        return CnameResolution {
+            result: Ok(auth_lookup),
+            resolved: false,
+            used_non_authoritative: false,
+        };
+    }
+
+    // Case 1: within-zone resolution is already placed the target in additionals.
+    let additionals_have_target = auth_lookup
+        .additionals()
+        .map_or(false, |mut iter| iter.any(|r| r.record_type() == query_type));
+
+    if additionals_have_target {
+        let mut all_answers: Vec<Record> = auth_lookup.iter().cloned().collect();
+        if let Some(additionals) = auth_lookup.additionals() {
+            all_answers.extend(additionals.cloned());
+        }
+        let merged = AuthLookup::answers(LookupRecords::Section(all_answers), None);
+        return CnameResolution {
+            result: Ok(merged),
+            resolved: true,
+            used_non_authoritative: false,
+        };
+    }
+
+    // Case 2: cross-zone CNAME, use whatever means necessary to resolve.
+    let cname_target = cname_target.unwrap();
+    debug!(
+        %cname_target,
+        query = %query,
+        "chasing unresolved CNAME for authoritative response with RD=1"
+    );
+
+    let (chased_records, used_non_auth) = catalog
+        .resolve_cname_chain(cname_target, query_type, lookup_options)
+        .await;
+
+    if chased_records.is_empty() {
+        return CnameResolution {
+            result: Ok(auth_lookup),
+            resolved: false,
+            used_non_authoritative: false,
+        };
+    }
+
+    let mut all_answers: Vec<Record> = auth_lookup.iter().cloned().collect();
+    all_answers.extend(chased_records);
+    let merged = AuthLookup::answers(LookupRecords::Section(all_answers), None);
+    CnameResolution {
+        result: Ok(merged),
+        resolved: true,
+        used_non_authoritative: used_non_auth,
+    }
+}
+
 /// Build Header and LookupSections (answers) given a query response from a zone handler
 async fn build_response(
     result: Result<AuthLookup, LookupError>,
     handler: &dyn ZoneHandler,
+    cname_flags: &CnameFlags,
     request_id: u16,
     request_header: &Header,
     query: &LowerQuery,
@@ -860,6 +1100,7 @@ async fn build_response(
             build_authoritative_response(
                 result,
                 handler,
+                cname_flags,
                 request_header,
                 lookup_options,
                 request_id,
@@ -885,13 +1126,24 @@ async fn build_response(
 async fn build_authoritative_response(
     response: Result<AuthLookup, LookupError>,
     handler: &dyn ZoneHandler,
+    cname_flags: &CnameFlags,
     request_header: &Header,
     lookup_options: LookupOptions,
     _request_id: u16,
     query: &LowerQuery,
 ) -> Message {
     let mut response_header = Header::response_from_request(request_header);
-    response_header.set_authoritative(true);
+    if cname_flags.used_non_authoritative {
+        // CNAME chasing pulled data from a non-authoritative source (e.g. recursive resolver).
+        response_header.set_authoritative(false);
+    } else {
+        response_header.set_authoritative(true);
+    }
+    if cname_flags.resolved {
+        // We resolved a CNAME chain on behalf of the client (RD=1), so indicate that
+        // recursion is available.
+        response_header.set_recursion_available(true);
+    }
 
     let mut message = Message::new(
         response_header.id(),

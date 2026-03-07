@@ -587,7 +587,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 };
 
                 if !is_subzone(&zone.base_name(), zns.name()) {
-                    warn!(
+                    debug!(
                         name = ?zns.name(),
                         parent = ?zone.base_name(),
                         "dropping out of bailiwick record",

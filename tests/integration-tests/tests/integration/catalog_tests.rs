@@ -1394,3 +1394,391 @@ async fn test_catalog_no_client_acl_allows_all() {
         );
     }
 }
+
+/// Helper to create an authoritative zone with custom records.
+fn create_zone(zone_name: &str) -> InMemoryZoneHandler {
+    let origin = Name::from_str(zone_name).unwrap();
+    let mut handler = InMemoryZoneHandler::empty(
+        origin.clone(),
+        ZoneType::Primary,
+        AxfrPolicy::Deny,
+        #[cfg(feature = "__dnssec")]
+        Some(NxProofKind::Nsec),
+    );
+    handler.upsert_mut(
+        Record::from_rdata(
+            origin.clone(),
+            3600,
+            RData::SOA(SOA::new(
+                Name::from_str("ns.example.com.").unwrap(),
+                Name::from_str("admin.example.com.").unwrap(),
+                1,
+                3600,
+                1800,
+                604800,
+                86400,
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+    handler.upsert_mut(
+        Record::from_rdata(
+            origin,
+            86400,
+            RData::NS(NS(Name::from_str("ns.example.com.").unwrap())),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+    handler
+}
+
+/// When an authoritative zone has a CNAME pointing to a name in another
+/// authoritative zone and the client sets RD=1, the response should contain
+/// both the CNAME record and the resolved target records.
+#[tokio::test]
+async fn test_cross_zone_cname_rd_set() {
+    subscribe();
+
+    // Zone 1: source.example.com has a CNAME pointing to target.other.example.com
+    let mut zone1 = create_zone("source.example.com.");
+    zone1.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("alias.source.example.com.").unwrap(),
+            3600,
+            RData::CNAME(CNAME(Name::from_str("target.other.example.com.").unwrap())),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    // Zone 2: other.example.com has the target A record
+    let mut zone2 = create_zone("other.example.com.");
+    zone2.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("target.other.example.com.").unwrap(),
+            3600,
+            RData::A(A::new(10, 0, 0, 1)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(zone1.origin().clone(), vec![Arc::new(zone1)]);
+    catalog.upsert(zone2.origin().clone(), vec![Arc::new(zone2)]);
+
+    // Query with RD=1
+    let mut question = Message::query();
+    question.set_recursion_desired(true);
+    let mut query = Query::new();
+    query.set_name(Name::from_str("alias.source.example.com.").unwrap());
+    query.set_query_type(RecordType::A);
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Udp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    assert_eq!(result.response_code(), ResponseCode::NoError);
+    assert!(
+        result.header().recursion_available(),
+        "RA should be set since we resolved the CNAME for an RD=1 request"
+    );
+    assert!(
+        result.header().authoritative(),
+        "AA should be set since all data came from authoritative zones"
+    );
+
+    let answers = result.answers();
+    assert_eq!(answers.len(), 2, "should have CNAME + resolved A record");
+    assert_eq!(answers[0].record_type(), RecordType::CNAME);
+    assert_eq!(
+        answers[0].data(),
+        &RData::CNAME(CNAME(Name::from_str("target.other.example.com.").unwrap()))
+    );
+    assert_eq!(answers[1].record_type(), RecordType::A);
+    assert_eq!(answers[1].data(), &RData::A(A::new(10, 0, 0, 1)));
+}
+
+/// When RD=0, cross-zone CNAME should NOT be chased - only the CNAME record is returned.
+#[tokio::test]
+async fn test_cross_zone_cname_rd_not_set() {
+    subscribe();
+
+    let mut zone1 = create_zone("source.example.com.");
+    zone1.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("alias.source.example.com.").unwrap(),
+            3600,
+            RData::CNAME(CNAME(Name::from_str("target.other.example.com.").unwrap())),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut zone2 = create_zone("other.example.com.");
+    zone2.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("target.other.example.com.").unwrap(),
+            3600,
+            RData::A(A::new(10, 0, 0, 1)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(zone1.origin().clone(), vec![Arc::new(zone1)]);
+    catalog.upsert(zone2.origin().clone(), vec![Arc::new(zone2)]);
+
+    // Query WITHOUT RD (default is false)
+    let mut question = Message::query();
+    let mut query = Query::new();
+    query.set_name(Name::from_str("alias.source.example.com.").unwrap());
+    query.set_query_type(RecordType::A);
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Udp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    assert_eq!(result.response_code(), ResponseCode::NoError);
+    let answers = result.answers();
+    assert_eq!(answers.len(), 1, "should only have CNAME, no chasing");
+    assert_eq!(answers[0].record_type(), RecordType::CNAME);
+}
+
+/// CNAME chain across three zones: alias -> intermediate CNAME -> final A record
+#[tokio::test]
+async fn test_cross_zone_cname_chain_rd_set() {
+    subscribe();
+
+    let mut zone1 = create_zone("zone1.example.com.");
+    zone1.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("start.zone1.example.com.").unwrap(),
+            3600,
+            RData::CNAME(CNAME(
+                Name::from_str("middle.zone2.example.com.").unwrap(),
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut zone2 = create_zone("zone2.example.com.");
+    zone2.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("middle.zone2.example.com.").unwrap(),
+            3600,
+            RData::CNAME(CNAME(Name::from_str("end.zone3.example.com.").unwrap())),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut zone3 = create_zone("zone3.example.com.");
+    zone3.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("end.zone3.example.com.").unwrap(),
+            3600,
+            RData::A(A::new(10, 0, 0, 3)),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(zone1.origin().clone(), vec![Arc::new(zone1)]);
+    catalog.upsert(zone2.origin().clone(), vec![Arc::new(zone2)]);
+    catalog.upsert(zone3.origin().clone(), vec![Arc::new(zone3)]);
+
+    let mut question = Message::query();
+    question.set_recursion_desired(true);
+    let mut query = Query::new();
+    query.set_name(Name::from_str("start.zone1.example.com.").unwrap());
+    query.set_query_type(RecordType::A);
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Udp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    assert_eq!(result.response_code(), ResponseCode::NoError);
+    let answers = result.answers();
+    // Original CNAME + intermediate CNAME + final A
+    assert_eq!(answers.len(), 3, "should have full CNAME chain + A record");
+    assert_eq!(answers[0].record_type(), RecordType::CNAME);
+    assert_eq!(answers[1].record_type(), RecordType::CNAME);
+    assert_eq!(answers[2].record_type(), RecordType::A);
+    assert_eq!(answers[2].data(), &RData::A(A::new(10, 0, 0, 3)));
+}
+
+/// CNAME loop is detected and does not cause infinite recursion.
+#[tokio::test]
+async fn test_cross_zone_cname_loop() {
+    subscribe();
+
+    let mut zone1 = create_zone("loop1.example.com.");
+    zone1.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("a.loop1.example.com.").unwrap(),
+            3600,
+            RData::CNAME(CNAME(
+                Name::from_str("b.loop2.example.com.").unwrap(),
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut zone2 = create_zone("loop2.example.com.");
+    zone2.upsert_mut(
+        Record::from_rdata(
+            Name::from_str("b.loop2.example.com.").unwrap(),
+            3600,
+            RData::CNAME(CNAME(
+                Name::from_str("a.loop1.example.com.").unwrap(),
+            )),
+        )
+        .set_dns_class(DNSClass::IN)
+        .clone(),
+        0,
+    );
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(zone1.origin().clone(), vec![Arc::new(zone1)]);
+    catalog.upsert(zone2.origin().clone(), vec![Arc::new(zone2)]);
+
+    let mut question = Message::query();
+    question.set_recursion_desired(true);
+    let mut query = Query::new();
+    query.set_name(Name::from_str("a.loop1.example.com.").unwrap());
+    query.set_query_type(RecordType::A);
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Udp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    // Should not hang or crash -- loop detection stops the chain.
+    assert_eq!(result.response_code(), ResponseCode::NoError);
+    let answers = result.answers();
+    // The original CNAME (a -> b) plus the first hop (b -> a), then loop detected and the
+    // looping records are discarded, leaving just the first two CNAMEs.
+    assert_eq!(
+        answers.len(),
+        2,
+        "should have original CNAME + first hop, loop records discarded"
+    );
+    assert_eq!(answers[0].record_type(), RecordType::CNAME);
+    assert_eq!(answers[1].record_type(), RecordType::CNAME);
+}
+
+/// Within-zone CNAME with RD=1: the full chain should be in the ANSWER section and RA
+/// should be set, since we resolved the CNAME on behalf of the client.
+#[tokio::test]
+async fn test_same_zone_cname_rd_set() {
+    subscribe();
+
+    let example = create_example();
+    let origin = example.origin().clone();
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(origin, vec![Arc::new(example)]);
+
+    let mut question = Message::query();
+    question.set_recursion_desired(true);
+    let mut query = Query::new();
+    query.set_name(Name::from_str("alias.example.com.").unwrap());
+    query.set_query_type(RecordType::A);
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Udp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    assert_eq!(result.response_code(), ResponseCode::NoError);
+    assert!(result.header().authoritative(), "should still be authoritative");
+    assert!(
+        result.header().recursion_available(),
+        "RA should be set since we resolved the CNAME for an RD=1 request"
+    );
+
+    // With RD=1 the full CNAME chain is placed in the answers section
+    let answers = result.answers();
+    assert_eq!(answers.len(), 2, "should have CNAME + resolved A record");
+    assert_eq!(answers[0].record_type(), RecordType::CNAME);
+    assert_eq!(answers[1].record_type(), RecordType::A);
+    assert_eq!(
+        answers[1].data(),
+        &RData::A(A::new(93, 184, 215, 14))
+    );
+}
