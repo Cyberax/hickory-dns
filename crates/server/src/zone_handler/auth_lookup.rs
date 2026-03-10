@@ -164,17 +164,18 @@ impl From<LookupRecords> for AuthLookup {
 
 /// A collection of [`RecordSet`]s for an AXFR.
 ///
-/// This omits the SOA record during iteration.
+/// This omits the SOA record during iteration. Per RFC 5936 Section 2.2,
+/// AXFR always includes all DNSSEC records (RRSIG, NSEC, etc.) regardless
+/// of the client's DO bit.
 #[derive(Debug)]
 pub struct AxfrRecords {
-    dnssec_ok: bool,
     rrsets: Vec<Arc<RecordSet>>,
 }
 
 impl AxfrRecords {
     /// Construct this wrapper around the contents of a zone.
-    pub fn new(dnssec_ok: bool, rrsets: Vec<Arc<RecordSet>>) -> Self {
-        Self { dnssec_ok, rrsets }
+    pub fn new(rrsets: Vec<Arc<RecordSet>>) -> Self {
+        Self { rrsets }
     }
 
     fn iter(&self) -> AxfrRecordsIter<'_> {
@@ -188,7 +189,6 @@ impl<'r> IntoIterator for &'r AxfrRecords {
 
     fn into_iter(self) -> Self::IntoIter {
         AxfrRecordsIter {
-            dnssec_ok: self.dnssec_ok,
             rrsets: self.rrsets.iter(),
             records: None,
         }
@@ -196,9 +196,9 @@ impl<'r> IntoIterator for &'r AxfrRecords {
 }
 
 /// An iterator over all records in a zone, except the SOA record.
+///
+/// Per RFC 5936, AXFR always includes RRSIGs regardless of the DO bit.
 pub struct AxfrRecordsIter<'r> {
-    #[cfg_attr(not(feature = "__dnssec"), allow(dead_code))]
-    dnssec_ok: bool,
     rrsets: Iter<'r, Arc<RecordSet>>,
     records: Option<RrsetRecords<'r>>,
 }
@@ -209,19 +209,23 @@ impl<'r> Iterator for AxfrRecordsIter<'r> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(records) = &mut self.records {
-                if let Some(record) = records
-                    .by_ref()
-                    .find(|record| record.record_type() != RecordType::SOA)
-                {
+                if let Some(record) = records.next() {
                     return Some(record);
                 }
             }
 
-            // Return if there are no more RRsets.
-            let rrset = self.rrsets.next()?;
+            // Skip SOA RRsets entirely — SOA is handled separately as
+            // start_soa/end_soa in ZoneTransfer.
+            let rrset = loop {
+                let rrset = self.rrsets.next()?;
+                if rrset.record_type() != RecordType::SOA {
+                    break rrset;
+                }
+            };
 
+            // AXFR always includes RRSIGs per RFC 5936 Section 2.2.
             #[cfg(feature = "__dnssec")]
-            let records = rrset.records(self.dnssec_ok);
+            let records = rrset.records_with_rrsigs();
 
             #[cfg(not(feature = "__dnssec"))]
             let records = rrset.records_without_rrsigs();

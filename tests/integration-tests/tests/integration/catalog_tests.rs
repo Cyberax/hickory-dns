@@ -1782,3 +1782,168 @@ async fn test_same_zone_cname_rd_set() {
         &RData::A(A::new(93, 184, 215, 14))
     );
 }
+
+/// AXFR of a DNSSEC-signed zone must include RRSIG, NSEC, and DNSKEY records
+/// even when the client does NOT set the EDNS DO bit (RFC 5936 Section 2.2).
+#[tokio::test]
+#[cfg(feature = "__dnssec")]
+async fn test_axfr_dnssec_records_without_do_bit() {
+    subscribe();
+
+    let mut handler = example_zone::create_secure_example();
+    handler.set_axfr_policy(AxfrPolicy::AllowAll);
+    let origin = handler.origin().clone();
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(origin.clone(), vec![Arc::new(handler)]);
+
+    // Build AXFR query WITHOUT EDNS/DO bit
+    let mut query = Query::new();
+    query.set_name(origin.clone().into());
+    query.set_query_type(RecordType::AXFR);
+
+    let mut question = Message::query();
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Tcp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+
+    assert_eq!(result.response_code(), ResponseCode::NoError);
+
+    let answers = result.answers();
+
+    // First and last records must be SOA
+    assert_eq!(
+        answers.first().unwrap().record_type(),
+        RecordType::SOA,
+        "first record must be SOA"
+    );
+    assert_eq!(
+        answers.last().unwrap().record_type(),
+        RecordType::SOA,
+        "last record must be SOA"
+    );
+
+    // Must contain RRSIG records (zone is signed)
+    let rrsig_count = answers
+        .iter()
+        .filter(|r| r.record_type() == RecordType::RRSIG)
+        .count();
+    assert!(
+        rrsig_count > 0,
+        "AXFR must include RRSIG records even without DO bit"
+    );
+
+    // Must contain NSEC records (zone uses NSEC)
+    let nsec_count = answers
+        .iter()
+        .filter(|r| r.record_type() == RecordType::NSEC)
+        .count();
+    assert!(
+        nsec_count > 0,
+        "AXFR must include NSEC records even without DO bit"
+    );
+
+    // Must contain DNSKEY records
+    let dnskey_count = answers
+        .iter()
+        .filter(|r| r.record_type() == RecordType::DNSKEY)
+        .count();
+    assert!(
+        dnskey_count > 0,
+        "AXFR must include DNSKEY records even without DO bit"
+    );
+}
+
+/// Verify SOA framing in DNSSEC AXFR:
+/// - First record is SOA, followed by RRSIG(SOA) (start_soa group)
+/// - Last record is bare SOA (end_soa, per RFC 5936)
+/// - Body contains no SOA or RRSIG(SOA) records
+#[tokio::test]
+#[cfg(feature = "__dnssec")]
+async fn test_axfr_dnssec_soa_framing() {
+    use hickory_proto::dnssec::rdata::DNSSECRData;
+
+    subscribe();
+
+    let mut handler = example_zone::create_secure_example();
+    handler.set_axfr_policy(AxfrPolicy::AllowAll);
+    let origin = handler.origin().clone();
+
+    let mut catalog = Catalog::new();
+    catalog.upsert(origin.clone(), vec![Arc::new(handler)]);
+
+    let mut query = Query::new();
+    query.set_name(origin.clone().into());
+    query.set_query_type(RecordType::AXFR);
+
+    let mut question = Message::query();
+    question.add_query(query);
+
+    let question_bytes = question.to_bytes().unwrap();
+    let question_req =
+        Request::from_bytes(question_bytes, ([127, 0, 0, 1], 5553).into(), Protocol::Tcp).unwrap();
+
+    let response_handler = TestResponseHandler::new();
+    catalog
+        .lookup(
+            &question_req,
+            None,
+            TokioTime::current_time(),
+            response_handler.clone(),
+        )
+        .await;
+    let result = response_handler.into_message().await;
+    let answers = result.answers();
+
+    // Helper: check if a record is an RRSIG covering SOA
+    let is_rrsig_soa = |r: &Record| -> bool {
+        if let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = r.data() {
+            rrsig.input().type_covered == RecordType::SOA
+        } else {
+            false
+        }
+    };
+
+    // First record is SOA, second should be RRSIG(SOA)
+    assert_eq!(answers[0].record_type(), RecordType::SOA, "first record must be SOA");
+    assert!(
+        is_rrsig_soa(&answers[1]),
+        "second record should be RRSIG covering SOA"
+    );
+
+    // Last record must be bare SOA (RFC 5936)
+    let n = answers.len();
+    assert_eq!(answers[n - 1].record_type(), RecordType::SOA, "last record must be SOA");
+
+    // Body (between start SOA group and end SOA) should not contain
+    // SOA records or RRSIG(SOA) records
+    let body = &answers[2..n - 1];
+    for record in body {
+        assert_ne!(
+            record.record_type(),
+            RecordType::SOA,
+            "body must not contain SOA records"
+        );
+        assert!(
+            !is_rrsig_soa(record),
+            "body must not contain RRSIG(SOA) records"
+        );
+    }
+
+    // Exactly one RRSIG(SOA) should exist (in start_soa)
+    let rrsig_soa_count = answers.iter().filter(|r| is_rrsig_soa(r)).count();
+    assert_eq!(rrsig_soa_count, 1, "should have exactly one RRSIG(SOA) in the transfer");
+}

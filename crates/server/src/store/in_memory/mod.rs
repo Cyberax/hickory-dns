@@ -530,13 +530,22 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
             }
         }
 
-        let future = self.lookup(self.origin(), RecordType::SOA, None, lookup_options);
+        // AXFR always includes DNSSEC records per RFC 5936 Section 2.2
+        let axfr_lookup_options = LookupOptions {
+            dnssec_ok: true,
+            ..lookup_options
+        };
+
+        let future = self.lookup(self.origin(), RecordType::SOA, None, axfr_lookup_options);
         let start_soa = if let LookupControlFlow::Continue(Ok(res)) = future.await {
             res.unwrap_records()
         } else {
             LookupRecords::Empty
         };
 
+        // end_soa must NOT include RRSIG — the bare SOA must be the very last
+        // record in the transfer per RFC 5936. The SOA's RRSIG is already
+        // included in the start_soa group above.
         let future = self.lookup(
             self.origin(),
             RecordType::SOA,
@@ -550,7 +559,6 @@ impl<P: RuntimeProvider + Send + Sync> ZoneHandler for InMemoryZoneHandler<P> {
         };
 
         let records = AxfrRecords::new(
-            lookup_options.dnssec_ok,
             self.inner.read().await.records.values().cloned().collect(),
         );
 
